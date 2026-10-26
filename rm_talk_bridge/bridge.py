@@ -85,10 +85,13 @@ def uplink_command(session: dict) -> list[str]:
 
 def downlink_command(url: str) -> list[str]:
     """Doorbell mic (RTSPS) → plain PCM for the phone, with as little buffering as possible."""
+    # Probe long enough to find the audio track (with probing at 0 ffmpeg can't see
+    # the audio stream's parameters and exits at once), then run with no buffering.
     return ["ffmpeg", "-nostdin", "-loglevel", "warning",
-            "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32768", "-analyzeduration", "0",
+            "-fflags", "nobuffer", "-flags", "low_delay",
+            "-probesize", "500000", "-analyzeduration", "1000000",
             "-rtsp_transport", "tcp", "-i", url,
-            "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "pipe:1"]
+            "-map", "0:a:0", "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "pipe:1"]
 
 
 async def stop(process: asyncio.subprocess.Process | None) -> None:
@@ -121,12 +124,14 @@ async def handle_talk(request: web.Request) -> web.WebSocketResponse:
 
         async with _busy:
             uplink = downlink = None
-            pump = None
+            pump = reporter = None
+            stderr_tasks = []
             try:
                 # 2. Ask Protect for a talkback session and the doorbell's live audio
                 session = await protect(http, "POST", f"/cameras/{DOORBELL}/talkback-session")
                 log.info("talkback session: %s", session)
                 listen_url = await rtsps_url(http)
+                log.info("doorbell audio from %s", listen_url.rsplit("/", 1)[0] + "/…")
 
                 uplink = await asyncio.create_subprocess_exec(
                     *uplink_command(session), stdin=asyncio.subprocess.PIPE,
@@ -135,13 +140,32 @@ async def handle_talk(request: web.Request) -> web.WebSocketResponse:
                     *downlink_command(listen_url), stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
+                counts = {"up": 0, "down": 0}
+
+                async def log_stderr(name, process):
+                    while True:
+                        line = await process.stderr.readline()
+                        if not line:
+                            break
+                        log.warning("%s ffmpeg: %s", name, line.decode(errors="ignore").strip())
+                stderr_tasks = [asyncio.create_task(log_stderr("uplink", uplink)),
+                                asyncio.create_task(log_stderr("downlink", downlink))]
+
                 async def pump_down():
                     while True:
                         chunk = await downlink.stdout.read(FRAME_BYTES)
                         if not chunk or ws.closed:
                             break
+                        counts["down"] += len(chunk)
                         await ws.send_bytes(chunk)
                 pump = asyncio.create_task(pump_down())
+
+                async def report():
+                    while True:
+                        await asyncio.sleep(5)
+                        log.info("audio: from phone %d KB, from doorbell %d KB%s", counts["up"] // 1024, counts["down"] // 1024,
+                                 "" if downlink.returncode is None else " (doorbell audio ffmpeg exited)")
+                reporter = asyncio.create_task(report())
 
                 await ws.send_json({"type": "ready", "sampleRate": SAMPLE_RATE})
                 log.info("talk started")
@@ -155,6 +179,7 @@ async def handle_talk(request: web.Request) -> web.WebSocketResponse:
                         log.info("no mic audio for %ss, ending", IDLE_TIMEOUT)
                         break
                     if message.type == aiohttp.WSMsgType.BINARY:
+                        counts["up"] += len(message.data)
                         if uplink.returncode is not None:
                             raise RuntimeError("talkback encoder stopped")
                         uplink.stdin.write(message.data)
@@ -168,13 +193,9 @@ async def handle_talk(request: web.Request) -> web.WebSocketResponse:
                 if not ws.closed:
                     await ws.send_json({"type": "error", "message": str(error)[:200]})
             finally:
-                if pump:
-                    pump.cancel()
-                for name, process in (("uplink", uplink), ("downlink", downlink)):
-                    if process and process.returncode is not None and process.stderr:
-                        detail = (await process.stderr.read())[-300:].decode(errors="ignore").strip()
-                        if detail:
-                            log.warning("%s ffmpeg: %s", name, detail)
+                for task in (pump, reporter, *stderr_tasks):
+                    if task:
+                        task.cancel()
                 await stop(uplink)
                 await stop(downlink)
                 if not ws.closed:
