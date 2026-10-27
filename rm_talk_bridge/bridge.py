@@ -74,8 +74,8 @@ def uplink_command(session: dict) -> list[str]:
     codec = str(session.get("codec", "opus")).lower()
     rate = str(session.get("samplingRate", 24000))
     target = session["url"]                   # e.g. rtp://10.7.10.30:7004
-    encoder = {"opus": ["-c:a", "libopus", "-application", "voip", "-frame_duration", "20", "-b:a", "32k",
-                        "-fec", "1", "-packet_loss", "5"],      # in-band FEC: covers the odd lost packet
+    # Note: no "-fec" here: ffmpeg applies it to the RTP output (which rejects it), not the Opus encoder.
+    encoder = {"opus": ["-c:a", "libopus", "-application", "voip", "-frame_duration", "20", "-b:a", "32k"],
                "aac": ["-c:a", "aac", "-b:a", "48k"],
                "pcmu": ["-c:a", "pcm_mulaw"], "pcma": ["-c:a", "pcm_alaw"]}.get(codec)
     if encoder is None:
