@@ -35,6 +35,8 @@ MAX_SECONDS = int(OPTIONS.get("max_session_seconds", 300))
 SAMPLE_RATE = 16000
 FRAME_BYTES = SAMPLE_RATE * 2 // 50          # 20 ms of 16-bit mono
 IDLE_TIMEOUT = 6                             # seconds without mic audio → end
+JITTER_TARGET = 3                            # frames (60 ms) buffered before sending to the doorbell
+JITTER_MAX = 12                              # frames (240 ms): beyond this, drop the oldest to stay live
 
 _busy = asyncio.Lock()                        # one talker at a time
 
@@ -72,7 +74,8 @@ def uplink_command(session: dict) -> list[str]:
     codec = str(session.get("codec", "opus")).lower()
     rate = str(session.get("samplingRate", 24000))
     target = session["url"]                   # e.g. rtp://10.7.10.30:7004
-    encoder = {"opus": ["-c:a", "libopus", "-application", "voip", "-frame_duration", "20", "-b:a", "32k"],
+    encoder = {"opus": ["-c:a", "libopus", "-application", "voip", "-frame_duration", "20", "-b:a", "32k",
+                        "-fec", "1", "-packet_loss", "5"],      # in-band FEC: covers the odd lost packet
                "aac": ["-c:a", "aac", "-b:a", "48k"],
                "pcmu": ["-c:a", "pcm_mulaw"], "pcma": ["-c:a", "pcm_alaw"]}.get(codec)
     if encoder is None:
@@ -124,14 +127,12 @@ async def handle_talk(request: web.Request) -> web.WebSocketResponse:
 
         async with _busy:
             uplink = downlink = None
-            pump = reporter = None
+            pump = pacer = None
             stderr_tasks = []
             try:
                 # 2. Ask Protect for a talkback session and the doorbell's live audio
                 session = await protect(http, "POST", f"/cameras/{DOORBELL}/talkback-session")
-                log.info("talkback session: %s", session)
                 listen_url = await rtsps_url(http)
-                log.info("doorbell audio from %s", listen_url.rsplit("/", 1)[0] + "/…")
 
                 uplink = await asyncio.create_subprocess_exec(
                     *uplink_command(session), stdin=asyncio.subprocess.PIPE,
@@ -140,7 +141,6 @@ async def handle_talk(request: web.Request) -> web.WebSocketResponse:
                     *downlink_command(listen_url), stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
-                counts = {"up": 0, "down": 0}
 
                 async def log_stderr(name, process):
                     while True:
@@ -156,16 +156,32 @@ async def handle_talk(request: web.Request) -> web.WebSocketResponse:
                         chunk = await downlink.stdout.read(FRAME_BYTES)
                         if not chunk or ws.closed:
                             break
-                        counts["down"] += len(chunk)
                         await ws.send_bytes(chunk)
                 pump = asyncio.create_task(pump_down())
 
-                async def report():
-                    while True:
-                        await asyncio.sleep(5)
-                        log.info("audio: from phone %d KB, from doorbell %d KB%s", counts["up"] // 1024, counts["down"] // 1024,
-                                 "" if downlink.returncode is None else " (doorbell audio ffmpeg exited)")
-                reporter = asyncio.create_task(report())
+                # Jitter buffer: mic audio arrives in bursts over Wi-Fi/TCP; the doorbell needs a
+                # steady 20 ms cadence. Buffer ~60 ms, then feed the encoder exactly in real time,
+                # filling short gaps with silence and trimming if it falls behind.
+                pending = bytearray()
+                primed = asyncio.Event()
+
+                async def pace_up():
+                    await primed.wait()
+                    silence = bytes(FRAME_BYTES)
+                    next_tick = time.monotonic()
+                    while uplink.returncode is None:
+                        if len(pending) > JITTER_MAX * FRAME_BYTES:
+                            del pending[: len(pending) - JITTER_TARGET * FRAME_BYTES]
+                        if len(pending) >= FRAME_BYTES:
+                            frame = bytes(pending[:FRAME_BYTES])
+                            del pending[:FRAME_BYTES]
+                        else:
+                            frame = silence
+                        uplink.stdin.write(frame)
+                        await uplink.stdin.drain()
+                        next_tick += 0.02
+                        await asyncio.sleep(max(0, next_tick - time.monotonic()))
+                pacer = asyncio.create_task(pace_up())
 
                 await ws.send_json({"type": "ready", "sampleRate": SAMPLE_RATE})
                 log.info("talk started")
@@ -179,11 +195,11 @@ async def handle_talk(request: web.Request) -> web.WebSocketResponse:
                         log.info("no mic audio for %ss, ending", IDLE_TIMEOUT)
                         break
                     if message.type == aiohttp.WSMsgType.BINARY:
-                        counts["up"] += len(message.data)
                         if uplink.returncode is not None:
                             raise RuntimeError("talkback encoder stopped")
-                        uplink.stdin.write(message.data)
-                        await uplink.stdin.drain()
+                        pending.extend(message.data)
+                        if not primed.is_set() and len(pending) >= JITTER_TARGET * FRAME_BYTES:
+                            primed.set()
                     elif message.type == aiohttp.WSMsgType.TEXT and json.loads(message.data).get("type") == "stop":
                         break
                     elif message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
@@ -193,7 +209,7 @@ async def handle_talk(request: web.Request) -> web.WebSocketResponse:
                 if not ws.closed:
                     await ws.send_json({"type": "error", "message": str(error)[:200]})
             finally:
-                for task in (pump, reporter, *stderr_tasks):
+                for task in (pump, pacer, *stderr_tasks):
                     if task:
                         task.cancel()
                 await stop(uplink)
