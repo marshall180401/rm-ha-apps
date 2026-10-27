@@ -31,6 +31,7 @@ API_KEY = OPTIONS["protect_api_key"]
 DOORBELL = OPTIONS["doorbell_id"]
 HA_URL = OPTIONS["ha_url"].rstrip("/")
 MAX_SECONDS = int(OPTIONS.get("max_session_seconds", 300))
+VIDEO_QUALITY = OPTIONS.get("talk_video_quality", "medium")    # low / medium / high
 
 SAMPLE_RATE = 16000
 FRAME_BYTES = SAMPLE_RATE * 2 // 50          # 20 ms of 16-bit mono
@@ -61,12 +62,29 @@ async def protect(session: aiohttp.ClientSession, method: str, path: str) -> dic
         return await response.json(content_type=None)
 
 
-async def rtsps_url(session: aiohttp.ClientSession) -> str:
+async def rtsps_urls(session: aiohttp.ClientSession) -> dict:
     streams = await protect(session, "GET", f"/cameras/{DOORBELL}/rtsps-stream")
-    url = streams.get("low") or streams.get("medium") or streams.get("high")
-    if not url:
+    urls = {k: v.split("?")[0] for k, v in streams.items() if isinstance(v, str) and v}  # no ?enableSrtp
+    if not urls:
         raise RuntimeError("doorbell has no RTSPS stream")
-    return url.split("?")[0]                  # ffmpeg doesn't want ?enableSrtp
+    return urls
+
+
+async def probe_video(url: str) -> dict | None:
+    """Codec and size of the stream's video, so the phone can set up the right decoder."""
+    process = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-rtsp_transport", "tcp", "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name,width,height", "-of", "json", url,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        out, _ = await asyncio.wait_for(process.communicate(), timeout=8)
+        stream = json.loads(out or b"{}").get("streams", [{}])[0]
+        codec = {"h264": "h264", "hevc": "hevc", "h265": "hevc"}.get(stream.get("codec_name", ""))
+        return {"codec": codec, "width": stream.get("width"), "height": stream.get("height")} if codec else None
+    except Exception:            # noqa: BLE001
+        if process.returncode is None:
+            process.kill()
+        return None
 
 
 def uplink_command(session: dict) -> list[str]:
@@ -84,6 +102,16 @@ def uplink_command(session: dict) -> list[str]:
             "-fflags", "nobuffer", "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", "pipe:0",
             *encoder, "-ar", rate, "-ac", "1",
             "-flush_packets", "1", "-f", "rtp", target]
+
+
+def video_command(url: str, codec: str) -> list[str]:
+    """Doorbell video passed through untouched (no re-encoding) as an Annex B stream."""
+    return ["ffmpeg", "-nostdin", "-loglevel", "error",
+            "-fflags", "nobuffer", "-flags", "low_delay",
+            "-probesize", "500000", "-analyzeduration", "1000000",
+            "-rtsp_transport", "tcp", "-i", url,
+            "-map", "0:v:0", "-an", "-c:v", "copy",
+            "-bsf:v", f"{codec}_mp4toannexb", "-f", codec, "pipe:1"]
 
 
 def downlink_command(url: str) -> list[str]:
@@ -111,9 +139,12 @@ async def handle_talk(request: web.Request) -> web.WebSocketResponse:
     # 1. Authenticate with the app's HA token (first message, within 5 s)
     try:
         first = await ws.receive(timeout=5)
-        token = json.loads(first.data).get("token", "") if first.type == aiohttp.WSMsgType.TEXT else ""
+        hello = json.loads(first.data) if first.type == aiohttp.WSMsgType.TEXT else {}
     except Exception:            # noqa: BLE001
-        token = ""
+        hello = {}
+    token = hello.get("token", "")
+    framed = bool(hello.get("framed"))          # newer app: typed frames (audio/video)
+    want_video = framed and bool(hello.get("video"))
     async with aiohttp.ClientSession() as http:
         if not token or not await ha_token_valid(http, token):
             await ws.send_json({"type": "error", "message": "Not signed in to Home Assistant"})
@@ -126,13 +157,25 @@ async def handle_talk(request: web.Request) -> web.WebSocketResponse:
             return ws
 
         async with _busy:
-            uplink = downlink = None
-            pump = pacer = None
+            uplink = downlink = video = None
+            pump = pacer = video_pump = None
             stderr_tasks = []
             try:
                 # 2. Ask Protect for a talkback session and the doorbell's live audio
                 session = await protect(http, "POST", f"/cameras/{DOORBELL}/talkback-session")
-                listen_url = await rtsps_url(http)
+                urls = await rtsps_urls(http)
+                listen_url = urls.get("low") or next(iter(urls.values()))
+                video_info = None
+                if want_video:
+                    video_url = urls.get(VIDEO_QUALITY) or urls.get("medium") or listen_url
+                    video_info = await probe_video(video_url)
+                    if video_info:
+                        video = await asyncio.create_subprocess_exec(
+                            *video_command(video_url, video_info["codec"]), stdin=asyncio.subprocess.DEVNULL,
+                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                        log.info("talk video: %s %sx%s", video_info["codec"], video_info["width"], video_info["height"])
+                    else:
+                        log.warning("talk video: couldn't detect the doorbell's video codec, audio only")
 
                 uplink = await asyncio.create_subprocess_exec(
                     *uplink_command(session), stdin=asyncio.subprocess.PIPE,
@@ -150,14 +193,25 @@ async def handle_talk(request: web.Request) -> web.WebSocketResponse:
                         log.warning("%s ffmpeg: %s", name, line.decode(errors="ignore").strip())
                 stderr_tasks = [asyncio.create_task(log_stderr("uplink", uplink)),
                                 asyncio.create_task(log_stderr("downlink", downlink))]
+                if video:
+                    stderr_tasks.append(asyncio.create_task(log_stderr("video", video)))
 
                 async def pump_down():
                     while True:
                         chunk = await downlink.stdout.read(FRAME_BYTES)
                         if not chunk or ws.closed:
                             break
-                        await ws.send_bytes(chunk)
+                        await ws.send_bytes(b"\x00" + chunk if framed else chunk)
                 pump = asyncio.create_task(pump_down())
+
+                async def pump_video():
+                    while True:
+                        chunk = await video.stdout.read(65536)
+                        if not chunk or ws.closed:
+                            break
+                        await ws.send_bytes(b"\x01" + chunk)
+                if video:
+                    video_pump = asyncio.create_task(pump_video())
 
                 # Jitter buffer: mic audio arrives in bursts over Wi-Fi/TCP; the doorbell needs a
                 # steady 20 ms cadence. Buffer ~60 ms, then feed the encoder exactly in real time,
@@ -183,7 +237,10 @@ async def handle_talk(request: web.Request) -> web.WebSocketResponse:
                         await asyncio.sleep(max(0, next_tick - time.monotonic()))
                 pacer = asyncio.create_task(pace_up())
 
-                await ws.send_json({"type": "ready", "sampleRate": SAMPLE_RATE})
+                ready = {"type": "ready", "sampleRate": SAMPLE_RATE, "framed": framed}
+                if video_info:
+                    ready["video"] = video_info
+                await ws.send_json(ready)
                 log.info("talk started")
 
                 # 3. Mic audio in until stop / close / idle / max length
@@ -209,11 +266,12 @@ async def handle_talk(request: web.Request) -> web.WebSocketResponse:
                 if not ws.closed:
                     await ws.send_json({"type": "error", "message": str(error)[:200]})
             finally:
-                for task in (pump, pacer, *stderr_tasks):
+                for task in (pump, pacer, video_pump, *stderr_tasks):
                     if task:
                         task.cancel()
                 await stop(uplink)
                 await stop(downlink)
+                await stop(video)
                 if not ws.closed:
                     await ws.close()
                 log.info("talk ended")
