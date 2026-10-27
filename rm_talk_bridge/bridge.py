@@ -232,7 +232,9 @@ def main() -> None:
     context.minimum_version = ssl.TLSVersion.TLSv1_2
 
     app = web.Application()
-    app.add_routes([web.get("/talk", handle_talk), web.get("/health", handle_health)])
+    # /talk on the LAN; /ui-talk-bridge/talk when reached through the Cloudflare tunnel path rule.
+    app.add_routes([web.get("/talk", handle_talk), web.get("/ui-talk-bridge/talk", handle_talk),
+                    web.get("/health", handle_health), web.get("/ui-talk-bridge/health", handle_health)])
     log.info("talk bridge on :8086 for doorbell %s via %s", DOORBELL, OPTIONS["protect_host"])
     web.run_app(app, host="0.0.0.0", port=8086, ssl_context=context, access_log=None)
 
