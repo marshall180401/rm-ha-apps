@@ -1,5 +1,5 @@
 name: RM Talk Bridge
-version: "1.1.0"
+version: "1.1.1"
 slug: rm_talk_bridge
 description: Live two-way talk between RM Protect and the UniFi Protect doorbell
 arch:
@@ -22,7 +22,7 @@ options:
   certfile: fullchain.pem
   keyfile: privkey.pem
   max_session_seconds: 300
-  talk_video_quality: medium
+  talk_video_quality: high
 schema:
   protect_host: str
   protect_api_key: password
